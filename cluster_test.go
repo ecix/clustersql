@@ -25,19 +25,56 @@
 
 package clustersql
 
-import "testing"
-import "github.com/go-sql-driver/mysql"
-import "database/sql"
+import (
+	"database/sql"
+	"fmt"
+	"github.com/BurntSushi/toml"
+	"github.com/go-sql-driver/mysql"
+	"os"
+	"sync"
+	"sync/atomic"
+	"testing"
+)
 
 var db *sql.DB
 
+type NodeCfg struct {
+	Name     string
+	HostName string
+	Port     int
+	UserName string
+	Password string
+	DBName   string
+}
+
+type Config struct {
+	Nodes []NodeCfg
+}
+
 func TestOpen(t *testing.T) {
+	cfgfile := os.Getenv("DBCONFIG")
+	if cfgfile == "" {
+		cfgfile = "config.toml"
+	}
+	cfg := new(Config)
+	if f, err := os.Open(cfgfile); err != nil {
+		t.Fatal(err, "(did you set the DBCONFIG env variable?)")
+	} else {
+		if _, err := toml.DecodeReader(f, cfg); err != nil {
+			t.Fatal(err)
+		}
+	}
+
 	d := NewDriver(mysql.MySQLDriver{})
-	
-	d.AddNode("maria1", "root:hunter2@tcp(127.0.0.1:3301)/test")
-	d.AddNode("maria2", "root:hunter2@tcp(127.0.0.2:3302)/test")
-	d.AddNode("maria3", "root:hunter2@tcp(127.0.0.3:3303)/test")
-	d.AddNode("maria4", "root:hunter2@tcp(127.0.0.4:3304)/test")
+
+	for _, ncfg := range cfg.Nodes {
+		if ncfg.Password != "" {
+			d.AddNode(ncfg.Name, fmt.Sprintf("%s:%s@tcp(%s:%d)/%s", ncfg.UserName, ncfg.Password, ncfg.HostName, ncfg.Port, ncfg.DBName))
+		} else {
+			d.AddNode(ncfg.Name, fmt.Sprintf("%s@tcp(%s:%d)/%s", ncfg.UserName, ncfg.HostName, ncfg.Port, ncfg.DBName))
+		}
+	}
+
 	sql.Register("cluster", d)
 	var err error
 	db, err = sql.Open("cluster", "galera")
@@ -167,4 +204,75 @@ func TestDelete(t *testing.T) {
 	if count != 0 {
 		t.Fatalf("Expected 0 affected row, got %d", count)
 	}
+}
+
+func TestConcurrent(t *testing.T) {
+	var max int
+	err := db.QueryRow("SELECT @@max_connections").Scan(&max)
+	if err != nil {
+		t.Fatalf("%s", err.Error())
+	}
+	// max = 100
+	fmt.Printf("Testing up to %d concurrent connections \r\n", max)
+	var remaining, succeeded int32 = int32(max), 0
+
+	var wg sync.WaitGroup
+	wg.Add(max)
+	var fatalError string
+	var once sync.Once
+	fatalf := func(s string, vals ...interface{}) {
+		once.Do(func() {
+			fatalError = fmt.Sprintf(s, vals...)
+		})
+	}
+
+	for i := 0; i < max; i++ {
+		go func(id int) {
+			defer wg.Done()
+
+			tx, err := db.Begin()
+			atomic.AddInt32(&remaining, -1)
+			fmt.Printf("%d ", remaining)
+
+			if err != nil {
+				if err.Error() != "Error 1040: Too many connections" {
+					//fmt.Printf("Begin: Error on Conn %d: %s", id, err.Error())
+					fatalf("Begin: Error on Conn %d: %s", id, err.Error())
+					// t.Logf("Begin: Error on Conn %d: %s", id, err.Error())
+				}
+				//fmt.Printf(" whoops ")
+				return
+			}
+
+			// keep the connection busy until all connections are open
+			for remaining > 0 {
+				if _, err = tx.Exec("DO 1"); err != nil {
+					//fmt.Printf("Exec: Error on Conn %d: %s", id, err.Error())
+					fatalf("Exec: Error on Conn %d: %s", id, err.Error())
+					return
+				}
+			}
+
+			if err = tx.Commit(); err != nil {
+				//fmt.Printf("Error on Conn %d: %s", id, err.Error())
+				fatalf("Error on Conn %d: %s", id, err.Error())
+				return
+			}
+
+			// everything went fine with this connection
+			atomic.AddInt32(&succeeded, 1)
+		}(i)
+	}
+
+	fmt.Println("waiting")
+	// wait until all conections are open
+	wg.Wait()
+	fmt.Println("waited")
+
+	if fatalError != "" {
+		t.Fatal(fatalError)
+	}
+
+	t.Logf("Reached %d concurrent connections\r\n", succeeded)
+
 }

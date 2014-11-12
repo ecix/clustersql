@@ -26,16 +26,16 @@
 // Package clustersql is an SQL "meta"-Driver - A clustering, implementation-
 // agnostic wrapper for any backend implementing "database/sql/driver".
 //
-// It does (latency-based) load-balancing and error-recovery over all registered
-// nodes.
+// It does (latency-based) load-balancing and error-recovery over the registered
+// set of nodes.
 //
 // It is assumed that database-state is transparently replicated over all
 // nodes by some database-side clustering solution. This driver ONLY handles
 // the client side of such a cluster.
 //
-// All errors which are made non-fatal because of failover are logged.
+// This package simply multiplexes the driver.Open() function of sql/driver to every attached node. The function is called on each node, returning the first successfully opened connection. (Any connections opening subsequently will be closed.) If opening does not succeed for any node, the latest error gets returned. Any other errors will be masked by default. However, any given latest error for any attached node will remain exposed through expvar, as well as some basic counters and timestamps.
 //
-// To make use of clustering, use clustersql with any backend driver
+// To make use of this kind of clustering, use this package with any backend driver
 // implementing "database/sql/driver" like so:
 //
 //  import "database/sql"
@@ -72,125 +72,93 @@
 //
 // Continue to use the sql interface as documented at
 // http://golang.org/pkg/database/sql/
+//
+// Before using this in production, you should configure your cluster details in config.toml and run
+//
+//  go test -v .
+//
+// Note however, that non-failure of the above is no guarantee for a correctly set-up cluster.
 package clustersql
 
-import "database/sql/driver"
-import "log"
+import (
+	"database/sql/driver"
+	"expvar"
+	"time"
+)
 
-//import "time"
-
-// ClusterError is an error type which represents an unrecoverable Error
-type ClusterError struct {
-	Message string
+type Driver struct {
+	nodes          []node
+	upstreamDriver driver.Driver
+	exp            *expvar.Map
 }
 
-func (ce ClusterError) Error() string {
-	return ce.Message
+type node struct {
+	Name string
+	DSN  string
+	exp  *expvar.Map
 }
 
-// Cluster is a type which implements "database/sql/driver"
-type Cluster struct {
-	Nodes  []*Node       // registered node instances
-	Driver driver.Driver // the upstream database driver
+// AddNode registers a new DSN as name with the upstream Driver.
+func (d *Driver) AddNode(name, DSN string) {
+	m := new(expvar.Map).Init()
+	n := node{name, DSN, m}
+	d.exp.Set(name, m)
+	d.nodes = append(d.nodes, n) //, nil, false, nil})
 }
 
-// AddNode registeres backend connection information with the driver
-//
-// dataSourceName will get passed to the "Open" call of the backend driver
-func (cluster *Cluster) AddNode(nodeName, dataSourceName string) {
-	_, err := cluster.Driver.Open(dataSourceName)
-	if err != nil {
-		log.Printf("Not adding Node '%s': %s\n", nodeName, err)
-	} else {
-		cluster.Nodes = append(cluster.Nodes, &Node{nodeName, dataSourceName, nil, false, nil})
+// Open will be called by sql.Open once registered. The name argument is ignored (it is only there to satisfy the driver interface)
+func (d Driver) Open(name string) (driver.Conn, error) {
+	type c struct {
+		conn driver.Conn
+		err  error
+		n    node
 	}
-}
-
-// Node is a type describing one node in the Cluster
-type Node struct {
-	Name           string      // node name
-	dataSourceName string      // DSN for the backend driver
-	Conn           driver.Conn // A currently cached backend connection
-	Waiting        bool        // the node is currently waiting for the backend to open a connection
-	Err            error       // the last error that was seen by the node
-}
-
-// GetConn concurrently opens connections to all nodes in the cluster, returning the first successfully opened driver.Conn.
-// If no driver.Conn could be successfully opened, return the latest error
-func (cluster *Cluster) GetConn() (driver.Conn, error) {
 	die := make(chan bool)
-	nodec := make(chan *Node)
-	for _, node := range cluster.Nodes {
-		go func(node *Node, nodec chan *Node, die chan bool) {
-			node.Conn, node.Err = cluster.Driver.Open(node.dataSourceName)
+	cc := make(chan c)
+	for _, n := range d.nodes {
+		go func(n node, cc chan c, die chan bool) {
+			conn, err := d.upstreamDriver.Open(n.DSN)
 			select {
-			case nodec <- node:
+			case cc <- c{conn, err, n}:
 				//log.Println("selected", node.Name)
 			case <-die:
-				//TODO: find out if this is redundant
-				if node.Conn != nil {
-					node.Conn.Close()
+				if conn != nil {
+					conn.Close()
 				}
 			}
-		}(node, nodec, die)
+		}(n, cc, die)
 	}
-	var n *Node
-	for n = range nodec {
-		if n.Conn != nil {
+	var n c
+	for i := 0; i < len(d.nodes); i++ {
+		Time := new(expvar.String)
+		n = <-cc
+		Time.Set(time.Now().String())
+		if n.err == nil {
+			n.n.exp.Add("Connections", 1)
+			n.n.exp.Set("LastSuccess", Time)
 			close(die)
 			break
 		} else {
-			log.Println(n.Err)
-		}
-	}
-	return n.Conn, n.Err
-}
-
-// Prepare works as documented at http://golang.org/pkg/database/sql/#DB.Prepare
-//
-// The query is executed on the node that reponds quickest
-func (cluster Cluster) Prepare(query string) (driver.Stmt, error) {
-	conn, err := cluster.GetConn()
-	if err != nil {
-		return nil, err
-	}
-	//log.Println(query)
-	return conn.Prepare(query)
-}
-
-// Close works on all backend-connections that are the clusterDriver has cached
-//
-// Always returns nil for now, errors are merely logged
-func (cluster Cluster) Close() error {
-	for name, node := range cluster.Nodes {
-		if node.Conn != nil {
-			if err := node.Conn.Close(); err != nil {
-				log.Println(name, err)
+			Err := new(expvar.String)
+			Err.Set(n.err.Error())
+			n.n.exp.Add("Errors", 1)
+			n.n.exp.Set("LastError", Time)
+			n.n.exp.Set("LastErrorMessage", Err)
+			//log.Println(n.n.Name, n.err)
+			if n.conn != nil {
+				n.conn.Close()
 			}
 		}
 	}
-	//FIXME
-	return nil
-}
-
-// Begin works as documented at http://golang.org/pkg/database/sql/#DB.Begin
-//
-// Begin() is called on the backend connection that is available quickest
-func (cluster Cluster) Begin() (driver.Tx, error) {
-	conn, err := cluster.GetConn()
-	if err != nil {
-		return nil, err
-	}
-	return conn.Begin()
-}
-
-// Open is a stub implementation to satisfy database/sql/driver interface. It does not do anything apart from returning its parent type.
-// NOTE: While the name argument does not do anything at this point, this may change in the future to allow the setting of e.g., timeout options
-func (cluster Cluster) Open(name string) (driver.Conn, error) {
-	return cluster, nil
+	return n.conn, n.err
 }
 
 // NewDriver returns an initialized Cluster driver, using upstreamDriver as backend
-func NewDriver(upstreamDriver driver.Driver) Cluster {
-	return Cluster{[]*Node{}, upstreamDriver}
+func NewDriver(upstreamDriver driver.Driver) Driver {
+	m := expvar.NewMap("ClusterSql")
+	Time := new(expvar.String)
+	Time.Set(time.Now().String())
+	m.Set("FirstInstanciated", Time)
+	cl := Driver{[]node{}, upstreamDriver, m}
+	return cl
 }
